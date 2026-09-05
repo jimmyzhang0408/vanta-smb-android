@@ -17,7 +17,9 @@ public final class SmbClient implements AutoCloseable {
 
     public SmbClient(String username, String password) throws Exception {
         Properties props = new Properties();
-        props.setProperty("jcifs.smb.client.enableSMB2", "true");
+        props.setProperty("jcifs.smb.client.minVersion", "SMB1");
+        props.setProperty("jcifs.smb.client.maxVersion", "SMB311");
+        props.setProperty("jcifs.smb.client.connTimeout", "10000");
         props.setProperty("jcifs.smb.client.responseTimeout", "10000");
         props.setProperty("jcifs.smb.client.soTimeout", "15000");
         props.setProperty("jcifs.netbios.retryTimeout", "3000");
@@ -43,11 +45,16 @@ public final class SmbClient implements AutoCloseable {
     }
 
     public void rename(SmbEntry source, String newName) throws Exception {
-        String parent = parentUrl(source.url);
+        if (!source.isJson()) throw new IllegalArgumentException("只能重命名 JSON 文件");
         try (SmbFile from = new SmbFile(source.url, context);
-             SmbFile to = new SmbFile(parent + encodePathSegment(newName), context)) {
+             SmbFile to = new SmbFile(renamedUrl(source.url, newName), context)) {
+            if (!from.exists()) throw new IllegalStateException("源文件已不存在，请刷新目录");
+            if (from.length() != source.length || from.lastModified() != source.modifiedAt) {
+                throw new IllegalStateException("文件仍在变化，请刷新目录并在设备写入完成后重试");
+            }
+            if (source.name.equals(newName)) return;
             if (to.exists()) throw new IllegalStateException("目标文件已存在：" + newName);
-            from.renameTo(to);
+            from.renameTo(to, false);
         }
     }
 
@@ -61,38 +68,44 @@ public final class SmbClient implements AutoCloseable {
             cleanHost = cleanHost.substring(0, slash);
         }
         if (cleanHost.isEmpty()) throw new IllegalArgumentException("请输入设备 IP 或主机名");
+        if (!cleanHost.matches("([A-Za-z0-9._-]+|\\[[A-Fa-f0-9:]+\\])(:[0-9]{1,5})?")) {
+            throw new IllegalArgumentException("设备地址只能包含 IP/主机名和可选端口，账号请填在下方");
+        }
         String combined = joinPath(hostPath, remotePath == null ? "" : remotePath.trim());
         StringBuilder url = new StringBuilder("smb://").append(cleanHost).append('/');
         if (!combined.isEmpty()) {
             for (String segment : combined.split("/+")) {
-                if (!segment.isEmpty()) url.append(encodePathSegment(segment)).append('/');
+                if (!segment.isEmpty()) {
+                    validateSegment(segment);
+                    // jCIFS uses URL.getPath() directly; percent escaping becomes part of the SMB filename.
+                    url.append(segment).append('/');
+                }
             }
         }
         return url.toString();
     }
 
     private static String joinPath(String left, String right) {
-        String a = left.replaceAll("^/+|/+$", "");
-        String b = right.replaceAll("^/+|/+$", "");
+        String a = left.replace('\\', '/').replaceAll("^/+|/+$", "");
+        String b = right.replace('\\', '/').replaceAll("^/+|/+$", "");
         if (a.isEmpty()) return b;
         if (b.isEmpty()) return a;
         return a + "/" + b;
     }
 
-    private static String encodePathSegment(String text) {
-        byte[] bytes = text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        StringBuilder out = new StringBuilder();
-        final char[] hex = "0123456789ABCDEF".toCharArray();
-        for (byte value : bytes) {
-            int b = value & 0xff;
-            if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
-                    (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.' || b == '~') {
-                out.append((char) b);
-            } else {
-                out.append('%').append(hex[b >> 4]).append(hex[b & 15]);
-            }
+    static String renamedUrl(String sourceUrl, String newName) {
+        validateSegment(newName);
+        if (!newName.toLowerCase(java.util.Locale.ROOT).endsWith(".json")) {
+            throw new IllegalArgumentException("文件必须保留 .json 扩展名");
         }
-        return out.toString();
+        return parentUrl(sourceUrl) + newName;
+    }
+
+    private static void validateSegment(String text) {
+        if (text.isEmpty() || text.equals(".") || text.equals("..")
+                || text.matches(".*[\\\\/:*?\"<>|#\\p{Cntrl}].*")) {
+            throw new IllegalArgumentException("路径或文件名包含不支持的字符");
+        }
     }
 
     private static String ensureDirectoryUrl(String url) {

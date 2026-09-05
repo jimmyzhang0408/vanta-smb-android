@@ -8,6 +8,7 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.io.ByteArrayOutputStream;
 
 public final class ScanTextParser {
     private static final Charset GB18030 = Charset.forName("GB18030");
@@ -18,6 +19,11 @@ public final class ScanTextParser {
     public static String normalize(String raw) {
         if (raw == null) return "";
         String cleaned = raw.replace("\u0000", "").trim();
+        if (cleaned.contains("|")) {
+            String[] fields = cleaned.split("\\|", -1);
+            for (int i = 0; i < fields.length; i++) fields[i] = normalize(fields[i]);
+            return String.join("|", fields);
+        }
         List<String> candidates = new ArrayList<>();
         candidates.add(cleaned);
         addLatin1Candidate(candidates, cleaned, StandardCharsets.UTF_8);
@@ -35,6 +41,28 @@ public final class ScanTextParser {
         return best;
     }
 
+    /** Byte segments are QR payload bytes, unlike SCAN_RESULT_BYTES (which includes QR codewords). */
+    public static String decodeQrText(String fallback, List<byte[]> segments) {
+        if (segments != null && !segments.isEmpty()) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            for (byte[] segment : segments) bytes.write(segment, 0, segment.length);
+            for (Charset encoding : new Charset[]{StandardCharsets.UTF_8, GB18030}) {
+                try {
+                    String decoded = encoding.newDecoder()
+                            .onMalformedInput(CodingErrorAction.REPORT)
+                            .onUnmappableCharacter(CodingErrorAction.REPORT)
+                            .decode(ByteBuffer.wrap(bytes.toByteArray())).toString();
+                    // QR can mix numeric/alphanumeric and byte segments. Partial payloads must not replace full text.
+                    if (decoded.split("\\|", -1).length == normalize(fallback).split("\\|", -1).length
+                            && decoded.contains("|")
+                            && decoded.replaceAll("[^\\x00-\\x7F]", "").equals(
+                                    normalize(fallback).replaceAll("[^\\x00-\\x7F]", ""))) return normalize(decoded);
+                } catch (CharacterCodingException ignored) {}
+            }
+        }
+        return normalize(fallback);
+    }
+
     public static String secondFieldAsFileStem(String raw) {
         String normalized = normalize(raw);
         String[] parts = normalized.split("\\|", -1);
@@ -45,13 +73,19 @@ public final class ScanTextParser {
         if (stem.toLowerCase(java.util.Locale.ROOT).endsWith(".json")) {
             stem = stem.substring(0, stem.length() - 5);
         }
-        stem = stem.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_")
+        if (stem.contains("\uFFFD")) {
+            throw new IllegalArgumentException("文件名存在无法还原的字符，请使用 UTF-8 重新生成二维码");
+        }
+        stem = stem.replaceAll("[\\\\/:*?\"<>|#\\p{Cntrl}]", "_")
                    .replaceAll("[. ]+$", "")
                    .trim();
         if (stem.isEmpty() || ".".equals(stem) || "..".equals(stem)) {
             throw new IllegalArgumentException("二维码第二段为空或不能作为文件名");
         }
-        if (stem.length() > 180) stem = stem.substring(0, 180);
+        if (stem.matches("(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\..*)?")) {
+            throw new IllegalArgumentException("二维码第二段为系统保留文件名");
+        }
+        if (stem.length() > 180) throw new IllegalArgumentException("二维码第二段过长，请使用不超过 180 个字符的样品编号");
         return stem;
     }
 

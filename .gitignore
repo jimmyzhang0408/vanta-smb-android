@@ -5,3 +5,9 @@ local.properties
 *.iml
 captures/
 .DS_Store
+*.apk
+*.aab
+*.jks
+*.keystore
+.env
+.env.*

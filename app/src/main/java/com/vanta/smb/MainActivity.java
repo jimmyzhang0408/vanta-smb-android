@@ -13,7 +13,7 @@ import android.net.NetworkCapabilities;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
+import android.util.Log;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -35,12 +35,9 @@ import java.text.DateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class MainActivity extends Activity {
     private static final long POLL_INTERVAL_MS = 4_000;
@@ -48,9 +45,8 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final AtomicBoolean requestInFlight = new AtomicBoolean(false);
     private final ArrayDeque<String> pathHistory = new ArrayDeque<>();
-    private final Set<String> knownJsonUrls = new HashSet<>();
+    private final JsonTracker jsonTracker = new JsonTracker();
     private final List<SmbEntry> entries = new ArrayList<>();
 
     private EditText hostInput;
@@ -60,24 +56,27 @@ public final class MainActivity extends Activity {
     private Button connectButton;
     private Button upButton;
     private Button refreshButton;
+    private Button scanTestButton;
     private TextView pathLabel;
     private TextView statusLabel;
     private ProgressBar progress;
     private ListView fileList;
     private EntryAdapter adapter;
 
-    private volatile SmbClient smbClient;
+    private SmbClient smbClient;
     private String currentUrl;
-    private String rootUrl;
     private SmbEntry pendingScanFile;
-    private boolean baselineEstablished;
-    private boolean jsonDialogShowing;
-    private long suppressAutoPromptUntil;
+    private boolean busy;
+    private boolean resumed;
+    private boolean destroyed;
+    private boolean scanFlowActive;
+    private boolean scanTest;
+    private boolean scannerLaunched;
 
     private final Runnable pollTask = new Runnable() {
         @Override public void run() {
-            if (smbClient != null && currentUrl != null) loadDirectory(false);
-            main.postDelayed(this, POLL_INTERVAL_MS);
+            if (resumed && !scanFlowActive && !busy) loadDirectory(false);
+            if (resumed) main.postDelayed(this, POLL_INTERVAL_MS);
         }
     };
 
@@ -85,7 +84,17 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         buildUi();
         restoreInputs();
-        main.postDelayed(pollTask, POLL_INTERVAL_MS);
+        if (state != null) {
+            currentUrl = state.getString("currentUrl");
+            scanFlowActive = state.getBoolean("scanFlowActive");
+            scannerLaunched = scanFlowActive;
+            scanTest = state.getBoolean("scanTest");
+            if (state.containsKey("pendingUrl")) {
+                pendingScanFile = new SmbEntry(state.getString("pendingName"),
+                        state.getString("pendingUrl"), false, state.getLong("pendingLength"),
+                        state.getLong("pendingModified"));
+            }
+        }
     }
 
     private void buildUi() {
@@ -141,6 +150,10 @@ public final class MainActivity extends Activity {
         connectButton = button("连接并浏览");
         connectButton.setOnClickListener(v -> connect());
         connection.addView(connectButton, new LinearLayout.LayoutParams(-1, dp(48)));
+        scanTestButton = button("扫码自检（无需连接设备）");
+        scanTestButton.setId(R.id.scan_test_button);
+        scanTestButton.setOnClickListener(v -> startScan(null));
+        connection.addView(scanTestButton, new LinearLayout.LayoutParams(-1, dp(48)));
         connectionScroll.addView(connection);
         root.addView(connectionScroll, new LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -185,6 +198,11 @@ public final class MainActivity extends Activity {
         root.addView(footer);
 
         setContentView(root);
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            return insets.consumeSystemWindowInsets();
+        });
     }
 
     private void restoreInputs() {
@@ -196,6 +214,7 @@ public final class MainActivity extends Activity {
     }
 
     private void connect() {
+        if (busy || scanFlowActive) return;
         final String host = hostInput.getText().toString();
         final String remotePath = pathInput.getText().toString();
         final String user = userInput.getText().toString().trim();
@@ -214,31 +233,29 @@ public final class MainActivity extends Activity {
                 .putString("host", host.trim()).putString("path", remotePath.trim())
                 .putString("user", user).putString("password", password).apply();
         setBusy(true, "正在连接 " + host.trim() + "…");
-        connectButton.setEnabled(false);
+        final SmbClient old = smbClient;
         io.execute(() -> {
             SmbClient candidate = null;
             try {
                 candidate = new SmbClient(user, password);
                 List<SmbEntry> firstPage = candidate.list(url);
-                SmbClient old = smbClient;
-                smbClient = candidate;
+                SmbClient connected = candidate;
                 candidate = null;
                 if (old != null) try { old.close(); } catch (Exception ignored) {}
-                List<SmbEntry> finalFirstPage = firstPage;
                 main.post(() -> {
-                    rootUrl = url;
+                    if (destroyed) {
+                        new Thread(() -> closeQuietly(connected), "smb-close").start();
+                        return;
+                    }
+                    smbClient = connected;
                     currentUrl = url;
                     pathHistory.clear();
-                    knownJsonUrls.clear();
-                    baselineEstablished = false;
-                    applyListing(finalFirstPage, true);
-                    refreshButton.setEnabled(true);
-                    connectButton.setEnabled(true);
+                    jsonTracker.reset();
+                    applyListing(firstPage, true);
                 });
             } catch (Exception error) {
                 if (candidate != null) try { candidate.close(); } catch (Exception ignored) {}
                 postFailure("连接失败", error);
-                main.post(() -> connectButton.setEnabled(true));
             }
         });
     }
@@ -246,18 +263,19 @@ public final class MainActivity extends Activity {
     private void loadDirectory(boolean userInitiated) {
         SmbClient client = smbClient;
         String url = currentUrl;
-        if (client == null || url == null || !requestInFlight.compareAndSet(false, true)) return;
-        if (userInitiated) setBusy(true, "正在刷新…");
+        if (destroyed || busy || scanFlowActive || client == null || url == null) return;
+        setBusy(true, userInitiated ? "正在刷新…" : "正在检查新 JSON…");
         io.execute(() -> {
             try {
                 List<SmbEntry> listing = client.list(url);
                 main.post(() -> {
-                    if (url.equals(currentUrl)) applyListing(listing, userInitiated);
-                    requestInFlight.set(false);
+                    if (!destroyed && url.equals(currentUrl)) applyListing(listing, userInitiated);
                 });
             } catch (Exception error) {
-                requestInFlight.set(false);
                 if (userInitiated) postFailure("读取目录失败", error);
+                else main.post(() -> {
+                    if (!destroyed) setBusy(false, "连接中断，将自动重试");
+                });
             }
         });
     }
@@ -267,41 +285,30 @@ public final class MainActivity extends Activity {
         entries.addAll(listing);
         adapter.notifyDataSetChanged();
         pathLabel.setText(displayUrl(currentUrl));
-        upButton.setEnabled(!pathHistory.isEmpty());
         setBusy(false, listing.isEmpty() ? "目录为空 · 每 4 秒自动检查 JSON" :
                 listing.size() + " 个项目 · 每 4 秒自动检查 JSON");
 
-        List<SmbEntry> newJson = new ArrayList<>();
-        Set<String> latest = new HashSet<>();
-        for (SmbEntry entry : listing) {
-            if (entry.isJson()) {
-                latest.add(entry.url);
-                if (baselineEstablished && !knownJsonUrls.contains(entry.url)) newJson.add(entry);
-            }
-        }
-        knownJsonUrls.clear();
-        knownJsonUrls.addAll(latest);
-        baselineEstablished = true;
-        if (SystemClock.elapsedRealtime() >= suppressAutoPromptUntil && !newJson.isEmpty()) {
-            promptForNewJson(newJson.get(0));
-        } else if (announce && !listing.isEmpty()) {
-            Toast.makeText(this, "目录已更新", Toast.LENGTH_SHORT).show();
-        }
+        jsonTracker.observe(listing);
+        promptNextJson();
     }
 
     private void openEntry(SmbEntry entry) {
+        if (busy || scanFlowActive) return;
         if (entry.directory) {
             pathHistory.push(currentUrl);
             currentUrl = entry.url.endsWith("/") ? entry.url : entry.url + "/";
-            baselineEstablished = false;
-            knownJsonUrls.clear();
-            setBusy(true, "正在打开 " + entry.name + "…");
+            jsonTracker.reset();
+            entries.clear();
+            adapter.notifyDataSetChanged();
             loadDirectory(true);
         } else if (entry.isJson()) {
+            scanFlowActive = true;
+            updateControls();
             new AlertDialog.Builder(this)
                     .setTitle("为 JSON 扫码命名")
                     .setMessage("文件：" + entry.name + "\n\n扫码后将使用二维码按 | 分隔的第二段重命名，并保留 .json 扩展名。")
-                    .setNegativeButton("取消", null)
+                    .setNegativeButton("取消", (dialog, which) -> finishScanFlow())
+                    .setOnCancelListener(dialog -> finishScanFlow())
                     .setPositiveButton("开始扫码", (dialog, which) -> startScan(entry))
                     .show();
         } else {
@@ -310,38 +317,53 @@ public final class MainActivity extends Activity {
     }
 
     private void navigateUp() {
-        if (pathHistory.isEmpty()) return;
+        if (busy || scanFlowActive || pathHistory.isEmpty()) return;
         currentUrl = pathHistory.pop();
-        baselineEstablished = false;
-        knownJsonUrls.clear();
-        setBusy(true, "正在返回上一级…");
+        jsonTracker.reset();
+        entries.clear();
+        adapter.notifyDataSetChanged();
         loadDirectory(true);
     }
 
+    private void promptNextJson() {
+        if (!resumed || busy || scanFlowActive || isFinishing() || destroyed) return;
+        SmbEntry entry = jsonTracker.next();
+        if (entry != null) promptForNewJson(entry);
+    }
+
     private void promptForNewJson(SmbEntry entry) {
-        if (jsonDialogShowing || isFinishing()) return;
-        jsonDialogShowing = true;
+        scanFlowActive = true;
+        updateControls();
         new AlertDialog.Builder(this)
                 .setTitle("检测到新的 JSON 文件")
                 .setMessage(entry.name + "\n\n现在扫码并用二维码第二段为它命名吗？")
-                .setNegativeButton("稍后", (dialog, which) -> jsonDialogShowing = false)
-                .setOnCancelListener(dialog -> jsonDialogShowing = false)
+                .setNegativeButton("稍后", (dialog, which) -> finishScanFlow())
+                .setOnCancelListener(dialog -> finishScanFlow())
                 .setPositiveButton("扫码命名", (dialog, which) -> {
-                    jsonDialogShowing = false;
                     startScan(entry);
                 })
                 .show();
     }
 
     private void startScan(SmbEntry entry) {
+        scanFlowActive = true;
+        scanTest = entry == null;
         pendingScanFile = entry;
+        updateControls();
         IntentIntegrator integrator = new IntentIntegrator(this);
         integrator.setCaptureActivity(PortraitCaptureActivity.class);
         integrator.setDesiredBarcodeFormats(IntentIntegrator.QR_CODE);
         integrator.setPrompt("扫描样品二维码");
-        integrator.setBeepEnabled(true);
-        integrator.setOrientationLocked(true);
-        integrator.initiateScan();
+        integrator.setOrientationLocked(false);
+        integrator.setBeepEnabled(false);
+        try {
+            scannerLaunched = true;
+            integrator.initiateScan();
+        } catch (RuntimeException error) {
+            Log.e("VantaScanner", "Unable to launch scanner", error);
+            finishScanFlow();
+            showError("无法打开扫码界面：" + usefulMessage(error));
+        }
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -350,45 +372,78 @@ public final class MainActivity extends Activity {
             super.onActivityResult(requestCode, resultCode, data);
             return;
         }
+        scannerLaunched = false;
         if (result.getContents() == null) {
-            Toast.makeText(this, "已取消扫码", Toast.LENGTH_SHORT).show();
+            String error = data == null ? null : data.getStringExtra(PortraitCaptureActivity.EXTRA_ERROR);
+            finishScanFlow();
+            if (error != null) {
+                showError(error);
+            } else {
+                Toast.makeText(this, "已取消扫码", Toast.LENGTH_SHORT).show();
+            }
             return;
         }
         SmbEntry file = pendingScanFile;
-        if (file == null) {
+        if (file == null && !scanTest) {
+            finishScanFlow();
             showError("没有待重命名的 JSON 文件");
             return;
         }
-        final String normalized = ScanTextParser.normalize(result.getContents());
+        final List<byte[]> segments = new ArrayList<>();
+        if (data != null) {
+            for (int i = 0; data.hasExtra("SCAN_RESULT_BYTE_SEGMENTS_" + i); i++) {
+                byte[] bytes = data.getByteArrayExtra("SCAN_RESULT_BYTE_SEGMENTS_" + i);
+                if (bytes != null) segments.add(bytes);
+            }
+        }
+        final String normalized = ScanTextParser.decodeQrText(result.getContents(), segments);
         final String stem;
         try {
             stem = ScanTextParser.secondFieldAsFileStem(normalized);
         } catch (IllegalArgumentException error) {
             new AlertDialog.Builder(this).setTitle("二维码格式不正确")
                     .setMessage(error.getMessage() + "\n\n识别内容：\n" + normalized)
-                    .setNegativeButton("取消", null)
+                    .setNegativeButton("取消", (dialog, which) -> finishScanFlow())
+                    .setOnCancelListener(dialog -> finishScanFlow())
                     .setPositiveButton("重新扫码", (dialog, which) -> startScan(file)).show();
             return;
         }
         String newName = stem + ".json";
+        if (scanTest) {
+            new AlertDialog.Builder(this).setTitle("扫码自检成功")
+                    .setMessage("识别内容：\n" + normalized + "\n\n解析文件名：" + newName
+                            + "\n\n自检不会重命名任何文件。")
+                    .setPositiveButton("完成", (dialog, which) -> finishScanFlow())
+                    .setOnCancelListener(dialog -> finishScanFlow()).show();
+            return;
+        }
         new AlertDialog.Builder(this)
                 .setTitle("确认重命名")
                 .setMessage(file.name + "\n→\n" + newName + "\n\n识别内容：\n" + normalized)
-                .setNegativeButton("取消", null)
+                .setNegativeButton("取消", (dialog, which) -> finishScanFlow())
+                .setOnCancelListener(dialog -> finishScanFlow())
                 .setPositiveButton("确认", (dialog, which) -> rename(file, newName))
                 .show();
     }
 
     private void rename(SmbEntry file, String newName) {
         SmbClient client = smbClient;
-        if (client == null) return;
+        // After process recreation, reconnect explicitly before modifying a remote file.
+        if (client == null) {
+            finishScanFlow();
+            showError("连接已被系统释放，请重新连接设备后对该文件扫码。");
+            return;
+        }
         setBusy(true, "正在重命名…");
         io.execute(() -> {
             try {
                 client.rename(file, newName);
-                suppressAutoPromptUntil = SystemClock.elapsedRealtime() + 6_000;
                 main.post(() -> {
+                    if (destroyed) return;
+                    jsonTracker.ignore(SmbClient.renamedUrl(file.url, newName));
                     Toast.makeText(this, "已重命名为 " + newName, Toast.LENGTH_LONG).show();
+                    setBusy(false, "重命名成功");
+                    finishScanFlow();
                     loadDirectory(true);
                 });
             } catch (Exception error) {
@@ -398,21 +453,51 @@ public final class MainActivity extends Activity {
     }
 
     private void setBusy(boolean busy, String status) {
+        this.busy = busy;
         progress.setVisibility(busy ? View.VISIBLE : View.GONE);
         statusLabel.setText(status);
+        updateControls();
+    }
+
+    private void updateControls() {
+        boolean enabled = !busy && !scanFlowActive;
+        connectButton.setEnabled(enabled);
+        scanTestButton.setEnabled(enabled);
+        upButton.setEnabled(enabled && !pathHistory.isEmpty());
+        refreshButton.setEnabled(enabled && smbClient != null);
+        fileList.setEnabled(enabled);
+        hostInput.setEnabled(enabled);
+        pathInput.setEnabled(enabled);
+        userInput.setEnabled(enabled);
+        passwordInput.setEnabled(enabled);
+    }
+
+    private void finishScanFlow() {
+        scanFlowActive = false;
+        pendingScanFile = null;
+        scanTest = false;
+        scannerLaunched = false;
+        updateControls();
+        main.post(this::promptNextJson);
     }
 
     private void postFailure(String title, Exception error) {
         String detail = usefulMessage(error);
         main.post(() -> {
+            if (destroyed || isFinishing()) return;
             setBusy(false, title);
+            scanFlowActive = true;
+            updateControls();
+            // Keep the flow blocked until the error is acknowledged.
             new AlertDialog.Builder(this).setTitle(title)
                     .setMessage(detail + "\n\n请确认手机已连接设备热点/同一局域网、共享路径正确，并检查账号密码。")
-                    .setPositiveButton("知道了", null).show();
+                    .setPositiveButton("知道了", (dialog, which) -> finishScanFlow())
+                    .setOnCancelListener(dialog -> finishScanFlow()).show();
         });
     }
 
     private void showError(String message) {
+        if (destroyed || isFinishing()) return;
         new AlertDialog.Builder(this).setTitle("提示").setMessage(message).setPositiveButton("知道了", null).show();
     }
 
@@ -478,12 +563,44 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        main.removeCallbacks(pollTask);
+        destroyed = true;
+        main.removeCallbacksAndMessages(null);
         SmbClient client = smbClient;
         smbClient = null;
-        io.shutdownNow();
-        if (client != null) try { client.close(); } catch (Exception ignored) {}
+        io.execute(() -> closeQuietly(client));
+        io.shutdown();
         super.onDestroy();
+    }
+
+    private static void closeQuietly(SmbClient client) {
+        if (client != null) try { client.close(); } catch (Exception ignored) {}
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        resumed = true;
+        main.removeCallbacks(pollTask);
+        main.postDelayed(pollTask, POLL_INTERVAL_MS);
+        main.post(this::promptNextJson);
+    }
+
+    @Override protected void onPause() {
+        resumed = false;
+        main.removeCallbacks(pollTask);
+        super.onPause();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString("currentUrl", currentUrl);
+        state.putBoolean("scanFlowActive", scannerLaunched);
+        state.putBoolean("scanTest", scanTest);
+        if (pendingScanFile != null) {
+            state.putString("pendingUrl", pendingScanFile.url);
+            state.putString("pendingName", pendingScanFile.name);
+            state.putLong("pendingLength", pendingScanFile.length);
+            state.putLong("pendingModified", pendingScanFile.modifiedAt);
+        }
     }
 
     private final class EntryAdapter extends BaseAdapter {

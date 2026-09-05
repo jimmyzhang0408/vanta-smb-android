@@ -8,6 +8,33 @@ import java.nio.charset.StandardCharsets;
 import static org.junit.Assert.assertEquals;
 
 public class ScanTextParserTest {
+    @Test public void decodesActualGbQrPayloadEvenIfDecoderGuessedAnotherCharset() {
+        String original = "材料有限公司|样品一号|热轧";
+        assertEquals(original, ScanTextParser.decodeQrText("乱码|乱码|乱码",
+                java.util.Collections.singletonList(original.getBytes(Charset.forName("GB18030")))));
+    }
+
+    @Test public void utf8PayloadPreservesChineseFilename() {
+        String original = "材料有限公司|样品一号|热轧";
+        assertEquals(original, ScanTextParser.decodeQrText(original,
+                java.util.Collections.singletonList(original.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    @Test public void ignoresPartialByteSegmentsInMixedModeQrCode() {
+        String original = "材料公司|SUP001|123456";
+        assertEquals(original, ScanTextParser.decodeQrText(original,
+                java.util.Collections.singletonList("材料公司".getBytes(StandardCharsets.UTF_8))));
+    }
+
+    @Test public void doesNotDropTrailingNumericModeSegment() {
+        String original = "材料公司|SUP001|123456";
+        assertEquals(original, ScanTextParser.decodeQrText(original,
+                java.util.Collections.singletonList("材料公司|SUP001|".getBytes(StandardCharsets.UTF_8))));
+    }
+
+    @Test(expected = IllegalArgumentException.class) public void rejectsIrreversiblyDamagedFilename() {
+        ScanTextParser.secondFieldAsFileStem("公司|样品\uFFFD|订单");
+    }
     @Test public void usesSecondPipeSeparatedField() {
         String raw = "XX材料有限公司|SUP001|PO2024001|MAT001|11|316|热轧|ASTM|1200*600*20|H2024001";
         assertEquals("SUP001", ScanTextParser.secondFieldAsFileStem(raw));
