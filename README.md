@@ -27,6 +27,8 @@ XX材料有限公司|SUP001|PO2024001|MAT001|11|316|热轧|ASTM|1200*600*20|H202
 使用 **JDK 17、Android SDK Platform 35**。项目自带 **Gradle 8.9 Wrapper**，AGP 版本为 8.7.3。Android Studio 可直接打开项目，命令行通过 `ANDROID_HOME` 或不提交的 `local.properties` 配置 SDK 路径：
 
 ```bash
+git clone https://github.com/jimmyzhang0408/vanta-smb-android.git
+cd vanta-smb-android
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
@@ -56,4 +58,4 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`。连接真实设备/�
 
 修复了扫码时缺少 AndroidX Core 导致的崩溃、Wrapper 版本不匹配、中文 SMB 路径错误、多文件漏提示及扫码期间继续弹窗问题。详见 [代码审查报告](docs/CODE_REVIEW.md) 和 [同事复测说明](docs/TESTING.md)。
 
-调试 APK 可侧载；正式发布应由维护者配置签名密钥。仓库不包含设备数据、本机 SDK 路径或签名密钥。若仓库为私有，需要在 GitHub Settings → Collaborators 邀请同事后才能访问。
+调试 APK 可侧载；正式发布应由维护者配置签名密钥。仓库不包含设备数据、本机 SDK 路径或签名密钥。当前新仓库为私有，需要在 GitHub Settings → Collaborators 邀请同事后才能访问。
